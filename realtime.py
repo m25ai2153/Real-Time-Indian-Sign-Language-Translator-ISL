@@ -19,12 +19,13 @@ import cv2
 import numpy as np
 from tensorflow.keras.models import load_model
 
-from utils import (ACTIONS_PATH, IDLE, MODEL_PATH, MU_PATH, SEQ_LEN, SIGMA_PATH,
-                   draw_landmarks, extract_keypoints, make_holistic,
-                   mediapipe_detection)
+from utils import (ACTIONS_PATH, IDLE, MIN_WINDOW_FRAMES, MODEL_PATH, MU_PATH,
+                   SEQ_LEN, SIGMA_PATH, WINDOW_SECONDS, draw_landmarks,
+                   extract_keypoints, make_holistic, mediapipe_detection,
+                   open_camera, resample_window)
 
 THRESHOLD = 0.85      # minimum confidence
-STABLE_FRAMES = 8     # consecutive frames that must agree
+STABLE_FRAMES = 6     # consecutive predictions that must agree
 MAX_GLOSSES = 8
 SAVE_FILE = "notes.txt"
 
@@ -65,7 +66,7 @@ def glosses_to_sentence(glosses):
 # ------------------------------------------------------------------ state
 colors = [(245, 117, 16), (117, 245, 16), (16, 117, 245), (200, 50, 200),
           (50, 200, 200), (200, 200, 50), (200, 50, 50)]
-buffer = deque(maxlen=SEQ_LEN)
+buffer = deque()                      # (timestamp, keypoints) for the last WINDOW_SECONDS
 recent = deque(maxlen=STABLE_FRAMES)
 probs = np.zeros(len(actions))
 glosses = []
@@ -91,7 +92,7 @@ def draw_probs(image, probs):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-cap = cv2.VideoCapture(0)
+cap = open_camera()
 try:
     with make_holistic() as holistic:
         while cap.isOpened():
@@ -102,12 +103,19 @@ try:
             draw_landmarks(image, results)
             h, w = image.shape[:2]
 
-            # Every frame goes into the window, including frames with no hands
-            # (zeros), exactly like the training samples.
-            buffer.append(extract_keypoints(results))
+            # Keep the last WINDOW_SECONDS of frames (including frames with no
+            # hands = zeros), then resample to SEQ_LEN exactly like record.py.
+            now = time.perf_counter()
+            buffer.append((now, extract_keypoints(results)))
+            while buffer and now - buffer[0][0] > WINDOW_SECONDS:
+                buffer.popleft()
 
-            if len(buffer) == SEQ_LEN:
-                x = (np.array(buffer) - mu) / sigma
+            window_ready = (len(buffer) >= MIN_WINDOW_FRAMES and
+                            buffer[-1][0] - buffer[0][0] >= 0.8 * WINDOW_SECONDS)
+            if window_ready:
+                stamps = [t for t, _ in buffer]
+                kps = [k for _, k in buffer]
+                x = (resample_window(stamps, kps, SEQ_LEN) - mu) / sigma
                 probs = model(x[None].astype(np.float32), training=False).numpy()[0]
                 idx = int(np.argmax(probs))
                 recent.append(idx if probs[idx] >= THRESHOLD else -1)

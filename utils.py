@@ -12,7 +12,7 @@ import mediapipe as mp
 # ---------------------------------------------------------------- vocabulary
 # Stage 1: one gloss. Stage 2: add more words to this list, record each one
 # with record.py, then retrain. Nothing else needs to change.
-GLOSSES = ["hello","name","head","ache","stomach"]
+GLOSSES = ["hello", "head", "ache", "stomach"]
 
 # A one-gloss model needs a "not signing" class, otherwise softmax always
 # outputs 1.0 for "hello" and the model can never say "nothing is happening".
@@ -20,8 +20,16 @@ IDLE = "idle"
 ACTIONS = GLOSSES + [IDLE]
 
 # --------------------------------------------------------------------- shape
-SEQ_LEN = 30                       # frames per sample (~1 second)
+SEQ_LEN = 30                       # frames fed to the model per sample
+WINDOW_SECONDS = 0.5               # how much real time one sample covers
 N_FEATURES = 33 * 4 + 21 * 3 * 2   # pose (x,y,z,vis) + left hand + right hand = 258
+
+# Camera request. 0.5 s at 30 frames needs 60 fps, which most webcams and a
+# CPU MediaPipe pipeline cannot deliver, so we capture whatever the pipeline
+# manages and resample to SEQ_LEN frames by timestamp (see resample_window).
+# The same code is used for recording and live use, so they always match.
+CAMERA_FPS = 60                    # requested; the camera may ignore it
+MIN_WINDOW_FRAMES = 6              # fewer real frames than this = unusable window
 
 # --------------------------------------------------------------------- paths
 DATA_PATH = os.path.join("Dataset", "MP_Data_v2")   # new folder: do not mix with old data
@@ -33,6 +41,30 @@ ACTIONS_PATH = os.path.join(ARTIFACTS, "actions.npy")
 
 mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
+
+
+def open_camera(index=0):
+    """Open the webcam with the same settings for recording and live use."""
+    cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # needed for high fps on many cams
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+    print(f"Camera reports {cap.get(cv2.CAP_PROP_FPS):.0f} fps (the real rate depends on MediaPipe speed)")
+    return cap
+
+
+def resample_window(timestamps, frames, n=SEQ_LEN):
+    """Turn a variable number of timed frames into exactly n evenly spaced frames.
+
+    Each of the n target times takes the nearest captured frame, so a window
+    of ~15 real frames becomes 30 (frames repeat). Nearest-frame is used
+    instead of interpolation because missing hands are all zeros and blending
+    them with real values would create fake poses.
+    """
+    ts = np.asarray(timestamps, dtype=np.float64)
+    frames = np.asarray(frames, dtype=np.float32)
+    targets = np.linspace(ts[0], ts[-1], n)
+    idx = np.abs(ts[None, :] - targets[:, None]).argmin(axis=1)
+    return frames[idx]
 
 
 def make_holistic():

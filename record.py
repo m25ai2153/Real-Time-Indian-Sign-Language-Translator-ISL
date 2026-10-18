@@ -6,8 +6,9 @@ Usage:
     python record.py hello --n 20   # record 20 more (appends, never overwrites)
 
 Each sample is one file: Dataset/MP_Data_v2/<label>/<index>.npy with shape (30, 258).
-A sample is only written once all 30 frames are captured, so pressing 'q'
-mid-sample never leaves a half-saved sequence behind.
+Each sample covers WINDOW_SECONDS of real time (set in utils.py) and is
+resampled to SEQ_LEN frames. A sample is only written once its window is
+complete, so pressing 'q' mid-sample never leaves a half-saved sequence behind.
 
 Tips for good data:
   * Record in several sessions (different lighting, distance, clothing).
@@ -22,8 +23,10 @@ import time
 import cv2
 import numpy as np
 
-from utils import (ACTIONS, DATA_PATH, IDLE, SEQ_LEN, draw_landmarks,
-                   extract_keypoints, make_holistic, mediapipe_detection)
+from utils import (ACTIONS, DATA_PATH, IDLE, MIN_WINDOW_FRAMES, SEQ_LEN,
+                   WINDOW_SECONDS, draw_landmarks, extract_keypoints,
+                   make_holistic, mediapipe_detection, open_camera,
+                   resample_window)
 
 COUNTDOWN_SECONDS = 2
 
@@ -52,7 +55,7 @@ def main():
     hint = "do NOT sign (vary what you do)" if args.label == IDLE else "perform the sign"
     print(f"Recording '{args.label}' from sample #{start}. Press 'q' to stop.")
 
-    cap = cv2.VideoCapture(0)
+    cap = open_camera()
     try:
         with make_holistic() as holistic:
             for i in range(start, start + args.n):
@@ -72,25 +75,35 @@ def main():
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         return
 
-                # ---- record SEQ_LEN frames
-                frames = []
-                for f in range(SEQ_LEN):
+                # ---- record WINDOW_SECONDS of real time, then resample to SEQ_LEN
+                stamps, frames = [], []
+                t_start = time.perf_counter()
+                while time.perf_counter() - t_start < WINDOW_SECONDS:
                     ret, frame = cap.read()
                     if not ret:
                         return
                     image, results = mediapipe_detection(frame, holistic)
                     draw_landmarks(image, results)
+                    stamps.append(time.perf_counter())
                     frames.append(extract_keypoints(results))
+                    elapsed = time.perf_counter() - t_start
                     banner(image, f"{args.label.upper()} #{i}  -  {hint}", (0, 0, 180))
-                    cv2.putText(image, f"RECORDING {f + 1}/{SEQ_LEN}", (100, 250),
+                    cv2.putText(image, f"RECORDING {elapsed:.2f}/{WINDOW_SECONDS}s", (60, 250),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
                     cv2.imshow("Record", image)
-                    if cv2.waitKey(10) & 0xFF == ord("q"):
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
                         print("Stopped; the unfinished sample was discarded.")
                         return
 
-                np.save(os.path.join(label_dir, f"{i}.npy"), np.array(frames))
-                print(f"saved {args.label}/{i}.npy")
+                if len(frames) < MIN_WINDOW_FRAMES:
+                    print(f"Only {len(frames)} real frames in {WINDOW_SECONDS}s - too few, "
+                          f"sample discarded. Close other apps / lower camera resolution.")
+                    continue
+
+                sample = resample_window(stamps, frames, SEQ_LEN)
+                np.save(os.path.join(label_dir, f"{i}.npy"), sample)
+                fps = (len(frames) - 1) / max(stamps[-1] - stamps[0], 1e-6)
+                print(f"saved {args.label}/{i}.npy  ({len(frames)} real frames, ~{fps:.0f} fps -> {SEQ_LEN})")
     finally:
         cap.release()
         cv2.destroyAllWindows()
