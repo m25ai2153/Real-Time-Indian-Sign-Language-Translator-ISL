@@ -4,6 +4,7 @@ Usage:
     python record.py hello          # record 30 samples of the sign
     python record.py idle           # record 30 samples of NOT signing
     python record.py hello --n 20   # record 20 more (appends, never overwrites)
+    python record.py head --min-hand 0.7   # re-record samples where the hand was lost too often
 
 Each sample is one file: Dataset/MP_Data_v2/<label>/<index>.npy with shape (30, 258).
 Each sample covers WINDOW_SECONDS of real time (set in utils.py) and is
@@ -47,6 +48,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("label", choices=ACTIONS)
     parser.add_argument("--n", type=int, default=30, help="new samples to record")
+    parser.add_argument("--min-hand", type=float, default=0.0,
+                        help="for signs (not idle): discard and re-record a sample if a hand "
+                             "was tracked in less than this fraction of frames, e.g. 0.7")
     args = parser.parse_args()
 
     label_dir = os.path.join(DATA_PATH, args.label)
@@ -58,7 +62,9 @@ def main():
     cap = open_camera()
     try:
         with make_holistic() as holistic:
-            for i in range(start, start + args.n):
+            saved = 0
+            while saved < args.n:          # rejected samples are re-recorded, not skipped
+                i = start + saved
                 # ---- get ready
                 t0 = time.time()
                 while time.time() - t0 < COUNTDOWN_SECONDS:
@@ -100,10 +106,19 @@ def main():
                           f"sample discarded. Close other apps / lower camera resolution.")
                     continue
 
+                # How often was a hand actually tracked? (hand values are all zero when lost)
+                hand_pct = float(np.mean(np.any(np.asarray(frames)[:, 132:] != 0, axis=1)))
+                if args.label != IDLE and hand_pct < args.min_hand:
+                    print(f"Hand tracked in only {hand_pct:.0%} of frames (< {args.min_hand:.0%}) - "
+                          f"sample discarded, record it again. Check lighting / keep the hand in view.")
+                    continue
+
                 sample = resample_window(stamps, frames, SEQ_LEN)
                 np.save(os.path.join(label_dir, f"{i}.npy"), sample)
+                saved += 1
                 fps = (len(frames) - 1) / max(stamps[-1] - stamps[0], 1e-6)
-                print(f"saved {args.label}/{i}.npy  ({len(frames)} real frames, ~{fps:.0f} fps -> {SEQ_LEN})")
+                print(f"saved {args.label}/{i}.npy  ({len(frames)} real frames, ~{fps:.0f} fps, "
+                      f"hand tracked {hand_pct:.0%})")
     finally:
         cap.release()
         cv2.destroyAllWindows()

@@ -1,16 +1,20 @@
 """Real-time sign recognition from the webcam.
 
 Usage:
-    python realtime.py              # glosses only (fine for one word)
+    python realtime.py              # glosses only
     python realtime.py --grammar    # also turn the gloss sequence into an English sentence
+    python realtime.py --debug      # also log every prediction to debug_probs.csv
 
 Keys:  Enter = finish sentence and save to notes.txt   c = clear   q = quit
 
-A gloss is added when the model is confident and stable for several frames.
-To repeat the same sign, return to a neutral pose first (the 'idle' class
-re-arms the detector).
+Glosses are decided by detector.py: a gloss prints as soon as the model is
+confident for a couple of predictions, or when a brief sign passes with a
+clear peak. Holding a sign prints it once; the next sign can follow
+immediately. When two glosses look alike and the model cannot separate them,
+nothing is printed (tune the thresholds at the top of detector.py).
 """
 import argparse
+import csv
 import threading
 import time
 from collections import deque
@@ -19,19 +23,21 @@ import cv2
 import numpy as np
 from tensorflow.keras.models import load_model
 
+from detector import GlossDetector
+from features import N_MODEL_FEATURES, build_features
 from utils import (ACTIONS_PATH, IDLE, MIN_WINDOW_FRAMES, MODEL_PATH, MU_PATH,
                    SEQ_LEN, SIGMA_PATH, WINDOW_SECONDS, draw_landmarks,
                    extract_keypoints, make_holistic, mediapipe_detection,
                    open_camera, resample_window)
 
-THRESHOLD = 0.85      # minimum confidence
-STABLE_FRAMES = 6     # consecutive predictions that must agree
 MAX_GLOSSES = 8
 SAVE_FILE = "notes.txt"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--grammar", action="store_true",
                     help="load the T5 model and convert glosses to a sentence")
+parser.add_argument("--debug", action="store_true",
+                    help="write every prediction to debug_probs.csv")
 args = parser.parse_args()
 
 # ------------------------------------------------------------------ load
@@ -41,6 +47,9 @@ mu = np.load(MU_PATH)
 sigma = np.load(SIGMA_PATH)
 actions = np.load(ACTIONS_PATH)
 print("Classes:", list(actions))
+if mu.shape[0] != N_MODEL_FEATURES:
+    raise SystemExit(f"The saved model expects {mu.shape[0]} features but features.py "
+                     f"produces {N_MODEL_FEATURES}. Run: python train.py")
 
 tokenizer = grammar_model = None
 if args.grammar:
@@ -67,11 +76,16 @@ def glosses_to_sentence(glosses):
 colors = [(245, 117, 16), (117, 245, 16), (16, 117, 245), (200, 50, 200),
           (50, 200, 200), (200, 200, 50), (200, 50, 50)]
 buffer = deque()                      # (timestamp, keypoints) for the last WINDOW_SECONDS
-recent = deque(maxlen=STABLE_FRAMES)
 probs = np.zeros(len(actions))
 glosses = []
-last_committed = None
+detector = GlossDetector(actions, idle=IDLE)
 state = {"sentence": "", "busy": False, "saved_until": 0.0}
+
+debug_file = debug_writer = None
+if args.debug:
+    debug_file = open("debug_probs.csv", "w", newline="", encoding="utf-8")
+    debug_writer = csv.writer(debug_file)
+    debug_writer.writerow(["time"] + [str(a) for a in actions] + ["printed"])
 
 
 def finish(gloss_list):
@@ -115,22 +129,25 @@ try:
             if window_ready:
                 stamps = [t for t, _ in buffer]
                 kps = [k for _, k in buffer]
-                x = (resample_window(stamps, kps, SEQ_LEN) - mu) / sigma
+                window = resample_window(stamps, kps, SEQ_LEN)
+                x = (build_features(window) - mu) / sigma
                 probs = model(x[None].astype(np.float32), training=False).numpy()[0]
-                idx = int(np.argmax(probs))
-                recent.append(idx if probs[idx] >= THRESHOLD else -1)
 
-                if len(recent) == STABLE_FRAMES and len(set(recent)) == 1 and recent[-1] != -1:
-                    label = str(actions[recent[-1]])
-                    if label == IDLE:
-                        last_committed = None            # re-arm
-                    elif label != last_committed:
-                        glosses.append(label)
-                        glosses[:] = glosses[-MAX_GLOSSES:]
-                        last_committed = label
-                        state["sentence"] = ""
+                printed = []
+                for label, p in detector.update(probs, now):
+                    glosses.append(label)
+                    glosses[:] = glosses[-MAX_GLOSSES:]
+                    state["sentence"] = ""
+                    printed.append(label)
+                    print(f"gloss: {label} ({p:.2f})")
+                if debug_writer:
+                    debug_writer.writerow([f"{now:.3f}"] + [f"{v:.3f}" for v in probs]
+                                          + [" ".join(printed)])
 
             draw_probs(image, probs)
+            top = int(np.argmax(probs))
+            cv2.putText(image, f"top: {actions[top]} {probs[top]:.2f}", (0, h - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
             cv2.rectangle(image, (0, 0), (w, 40), (245, 117, 16), -1)
             cv2.putText(image, "Glosses: " + " ".join(glosses), (3, 30),
@@ -144,7 +161,7 @@ try:
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3, cv2.LINE_AA)
 
             cv2.imshow("Sign translator (Enter=save, c=clear, q=quit)", image)
-            key = cv2.waitKey(10) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             elif key == ord("c"):
@@ -158,3 +175,5 @@ try:
 finally:
     cap.release()
     cv2.destroyAllWindows()
+    if debug_file:
+        debug_file.close()

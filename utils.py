@@ -12,7 +12,12 @@ import mediapipe as mp
 # ---------------------------------------------------------------- vocabulary
 # Stage 1: one gloss. Stage 2: add more words to this list, record each one
 # with record.py, then retrain. Nothing else needs to change.
-GLOSSES = ["hello", "head", "ache", "stomach"]
+GLOSSES = ["hello", "head", "ache", "stomach", "need", "doctor", 
+           "I", "you", "he", "she", "we", "they", "want", "go", "come", 
+           "eat", "drink", "water", "food", "help", "stop", "wait", "yes", "no", 
+           "good", "bad", "happy", "sad", "angry", "tired", "sleep", "wake", "work", 
+           "school", "play", "run", "walk", "sit", "stand", "open", "close", "big", "small", 
+           "hot", "cold", "fast", "slow", "more", "good", "morning", "night", "afternoon"]
 
 # A one-gloss model needs a "not signing" class, otherwise softmax always
 # outputs 1.0 for "hello" and the model can never say "nothing is happening".
@@ -20,8 +25,8 @@ IDLE = "idle"
 ACTIONS = GLOSSES + [IDLE]
 
 # --------------------------------------------------------------------- shape
-SEQ_LEN = 30                       # frames fed to the model per sample
-WINDOW_SECONDS = 0.5               # how much real time one sample covers
+SEQ_LEN = 32                       # frames fed to the model per sample
+WINDOW_SECONDS = 1               # how much real time one sample covers
 N_FEATURES = 33 * 4 + 21 * 3 * 2   # pose (x,y,z,vis) + left hand + right hand = 258
 
 # Camera request. 0.5 s at 30 frames needs 60 fps, which most webcams and a
@@ -68,8 +73,8 @@ def resample_window(timestamps, frames, n=SEQ_LEN):
 
 
 def make_holistic():
-    return mp_holistic.Holistic(min_detection_confidence=0.5,
-                                min_tracking_confidence=0.5)
+    return mp_holistic.Holistic(min_detection_confidence=0.3,
+                                min_tracking_confidence=0.3)
 
 
 def mediapipe_detection(image, model):
