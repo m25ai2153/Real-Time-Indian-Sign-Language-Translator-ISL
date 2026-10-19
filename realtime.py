@@ -4,6 +4,7 @@ Usage:
     python realtime.py              # glosses only
     python realtime.py --grammar    # also turn the gloss sequence into an English sentence
     python realtime.py --debug      # also log every prediction to debug_probs.csv
+    python realtime.py --save-run run1.npz   # also keep the raw frames, to replay and tune offline
 
 Keys:  Enter = finish sentence and save to notes.txt   c = clear   q = quit
 
@@ -12,15 +13,24 @@ confident for a couple of predictions, or when a brief sign passes with a
 clear peak. Holding a sign prints it once; the next sign can follow
 immediately. When two glosses look alike and the model cannot separate them,
 nothing is printed (tune the thresholds at the top of detector.py).
+
+Speed: the camera loop (MediaPipe) and the model run in separate threads.
+Before, every frame waited for the model, so the loop ran at ~5 fps while the
+training data was recorded at ~18 fps; a sign then reached the model as just a
+few frames. Now the loop only captures and draws, so frames arrive at the same
+rate as when recording, and the model predicts on the newest window as fast as
+it can. The top-left of the picture shows both rates.
 """
 import argparse
 import csv
 import threading
 import time
+import traceback
 from collections import deque
 
 import cv2
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 
 from detector import GlossDetector
@@ -38,6 +48,8 @@ parser.add_argument("--grammar", action="store_true",
                     help="load the T5 model and convert glosses to a sentence")
 parser.add_argument("--debug", action="store_true",
                     help="write every prediction to debug_probs.csv")
+parser.add_argument("--save-run", metavar="FILE", default=None,
+                    help="save every captured frame (timestamps + keypoints) to this .npz file")
 args = parser.parse_args()
 
 # ------------------------------------------------------------------ load
@@ -50,6 +62,14 @@ print("Classes:", list(actions))
 if mu.shape[0] != N_MODEL_FEATURES:
     raise SystemExit(f"The saved model expects {mu.shape[0]} features but features.py "
                      f"produces {N_MODEL_FEATURES}. Run: python train.py")
+
+
+@tf.function(reduce_retracing=True)
+def predict_fn(x):
+    return model(x, training=False)
+
+
+predict_fn(tf.zeros((1, SEQ_LEN, N_MODEL_FEATURES), tf.float32))   # build once, not during the first sign
 
 tokenizer = grammar_model = None
 if args.grammar:
@@ -76,16 +96,22 @@ def glosses_to_sentence(glosses):
 colors = [(245, 117, 16), (117, 245, 16), (16, 117, 245), (200, 50, 200),
           (50, 200, 200), (200, 200, 50), (200, 50, 50)]
 buffer = deque()                      # (timestamp, keypoints) for the last WINDOW_SECONDS
+lock = threading.Lock()               # guards buffer, probs, glosses and the counters below
+new_frame = threading.Event()
+stop = threading.Event()
 probs = np.zeros(len(actions))
 glosses = []
-detector = GlossDetector(actions, idle=IDLE)
-state = {"sentence": "", "busy": False, "saved_until": 0.0}
+detector = GlossDetector(actions, idle=IDLE)          # only the inference thread touches it
+state = {"sentence": "", "busy": False, "saved_until": 0.0,
+         "frames": 0, "preds": 0, "error": None}
 
 debug_file = debug_writer = None
 if args.debug:
     debug_file = open("debug_probs.csv", "w", newline="", encoding="utf-8")
     debug_writer = csv.writer(debug_file)
     debug_writer.writerow(["time"] + [str(a) for a in actions] + ["printed"])
+
+run_stamps, run_kps = [], []          # only filled with --save-run
 
 
 def finish(gloss_list):
@@ -98,18 +124,64 @@ def finish(gloss_list):
     state["busy"] = False
 
 
-def draw_probs(image, probs):
-    for i, p in enumerate(probs):
-        cv2.rectangle(image, (0, 60 + i * 40), (int(p * 200), 90 + i * 40),
+def inference_loop():
+    """Predict on the newest window as often as the model allows, independent of the camera."""
+    global probs
+    last_stamp = None
+    try:
+        while not stop.is_set():
+            if not new_frame.wait(0.1):
+                continue
+            new_frame.clear()
+            with lock:                                  # snapshot, so the camera keeps going
+                if (not buffer or buffer[-1][0] == last_stamp or len(buffer) < MIN_WINDOW_FRAMES
+                        or buffer[-1][0] - buffer[0][0] < 0.8 * WINDOW_SECONDS):
+                    continue
+                snap = list(buffer)
+            last_stamp = snap[-1][0]
+            stamps = [t for t, _ in snap]
+            window = resample_window(stamps, [k for _, k in snap], SEQ_LEN)
+            x = (build_features(window) - mu) / sigma
+            p = predict_fn(tf.constant(x[None], tf.float32)).numpy()[0]
+
+            printed = []
+            for label, prob in detector.update(p, last_stamp):
+                printed.append(label)
+                print(f"gloss: {label} ({prob:.2f})")
+            with lock:
+                probs = p
+                for label in printed:
+                    glosses.append(label)
+                glosses[:] = glosses[-MAX_GLOSSES:]
+                if printed:
+                    state["sentence"] = ""
+                state["preds"] += 1
+            if debug_writer:
+                debug_writer.writerow([f"{last_stamp:.3f}"] + [f"{v:.3f}" for v in p]
+                                      + [" ".join(printed)])
+    except Exception:                                   # show the real error, then stop everything
+        state["error"] = traceback.format_exc()
+        stop.set()
+
+
+def draw_probs(image, p):
+    for i, v in enumerate(p):
+        cv2.rectangle(image, (0, 60 + i * 40), (int(v * 200), 90 + i * 40),
                       colors[i % len(colors)], -1)
         cv2.putText(image, str(actions[i]), (0, 85 + i * 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
 
+worker = threading.Thread(target=inference_loop, daemon=True)
+worker.start()
+t_start = time.perf_counter()
+last_rate = (t_start, 0, 0)
+rate_text = ""
+
 cap = open_camera()
 try:
     with make_holistic() as holistic:
-        while cap.isOpened():
+        while cap.isOpened() and not stop.is_set():
             ret, frame = cap.read()
             if not ret:
                 break
@@ -118,40 +190,38 @@ try:
             h, w = image.shape[:2]
 
             # Keep the last WINDOW_SECONDS of frames (including frames with no
-            # hands = zeros), then resample to SEQ_LEN exactly like record.py.
+            # hands = zeros); the inference thread resamples them to SEQ_LEN
+            # exactly like record.py does.
             now = time.perf_counter()
-            buffer.append((now, extract_keypoints(results)))
-            while buffer and now - buffer[0][0] > WINDOW_SECONDS:
-                buffer.popleft()
+            kp = extract_keypoints(results)
+            with lock:
+                buffer.append((now, kp))
+                while buffer and now - buffer[0][0] > WINDOW_SECONDS:
+                    buffer.popleft()
+                state["frames"] += 1
+                cur_probs = probs.copy()
+                cur_glosses = list(glosses)
+            if args.save_run:
+                run_stamps.append(now)
+                run_kps.append(kp)
+            new_frame.set()
 
-            window_ready = (len(buffer) >= MIN_WINDOW_FRAMES and
-                            buffer[-1][0] - buffer[0][0] >= 0.8 * WINDOW_SECONDS)
-            if window_ready:
-                stamps = [t for t, _ in buffer]
-                kps = [k for _, k in buffer]
-                window = resample_window(stamps, kps, SEQ_LEN)
-                x = (build_features(window) - mu) / sigma
-                probs = model(x[None].astype(np.float32), training=False).numpy()[0]
+            if now - last_rate[0] >= 1.0:               # camera and model rates, refreshed every second
+                dt = now - last_rate[0]
+                rate_text = (f"cam {(state['frames'] - last_rate[1]) / dt:.0f} fps | "
+                             f"model {(state['preds'] - last_rate[2]) / dt:.0f}/s")
+                last_rate = (now, state["frames"], state["preds"])
 
-                printed = []
-                for label, p in detector.update(probs, now):
-                    glosses.append(label)
-                    glosses[:] = glosses[-MAX_GLOSSES:]
-                    state["sentence"] = ""
-                    printed.append(label)
-                    print(f"gloss: {label} ({p:.2f})")
-                if debug_writer:
-                    debug_writer.writerow([f"{now:.3f}"] + [f"{v:.3f}" for v in probs]
-                                          + [" ".join(printed)])
-
-            draw_probs(image, probs)
-            top = int(np.argmax(probs))
-            cv2.putText(image, f"top: {actions[top]} {probs[top]:.2f}", (0, h - 50),
+            draw_probs(image, cur_probs)
+            top = int(np.argmax(cur_probs))
+            cv2.putText(image, f"top: {actions[top]} {cur_probs[top]:.2f}", (0, h - 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
             cv2.rectangle(image, (0, 0), (w, 40), (245, 117, 16), -1)
-            cv2.putText(image, "Glosses: " + " ".join(glosses), (3, 30),
+            cv2.putText(image, "Glosses: " + " ".join(cur_glosses), (3, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(image, rate_text, (w - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 2, cv2.LINE_AA)
             cv2.rectangle(image, (0, h - 40), (w, h), (35, 35, 35), -1)
             text = "Translating..." if state["busy"] else state["sentence"]
             cv2.putText(image, text, (3, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
@@ -165,15 +235,27 @@ try:
             if key == ord("q"):
                 break
             elif key == ord("c"):
-                glosses.clear()
+                with lock:
+                    glosses.clear()
                 state["sentence"] = ""
-            elif key == 13 and glosses and not state["busy"]:
+            elif key == 13 and cur_glosses and not state["busy"]:
                 state["busy"] = True
                 # Run off the video thread so the feed does not freeze.
-                threading.Thread(target=finish, args=(list(glosses),), daemon=True).start()
-                glosses.clear()
+                threading.Thread(target=finish, args=(list(cur_glosses),), daemon=True).start()
+                with lock:
+                    glosses.clear()
 finally:
+    stop.set()
+    worker.join(timeout=2.0)
     cap.release()
     cv2.destroyAllWindows()
     if debug_file:
         debug_file.close()
+    secs = max(time.perf_counter() - t_start, 1e-6)
+    print(f"Average: camera {state['frames'] / secs:.1f} fps, model {state['preds'] / secs:.1f} predictions/s")
+    if args.save_run and run_stamps:
+        np.savez_compressed(args.save_run, stamps=np.asarray(run_stamps) - run_stamps[0],
+                            keypoints=np.asarray(run_kps, dtype=np.float32))
+        print(f"Saved {len(run_stamps)} frames to {args.save_run}")
+if state["error"]:
+    raise SystemExit("The recognition thread crashed:\n" + state["error"])
