@@ -13,11 +13,13 @@ import mediapipe as mp
 # Stage 1: one gloss. Stage 2: add more words to this list, record each one
 # with record.py, then retrain. Nothing else needs to change.
 GLOSSES = ["hello", "head", "ache", "stomach", "need", "doctor", 
-           "I", "you", "he", "she", "we", "they", "want", "go", "come", 
-           "eat", "drink", "water", "food", "help", "stop", "wait", "yes", "no", 
-           "good", "bad", "happy", "sad", "angry", "tired", "sleep", "wake", "work", 
-           "school", "play", "run", "walk", "sit", "stand", "open", "close", "big", "small", 
-           "hot", "cold", "fast", "slow", "more", "good", "morning", "night", "afternoon"]
+           "I", "you", "he", "she", "good", "morning", "night", "afternoon"]
+
+#"we", "they", "want", "go", "come", 
+#           "eat", "drink", "water", "food", "help", "stop", "wait", "yes", "no", 
+#           "good", "bad", "happy", "sad", "angry", "tired", "sleep", "wake", "work", 
+#           "school", "play", "run", "walk", "sit", "stand", "open", "close", "big", "small", 
+#           "hot", "cold", "fast", "slow", "more", 
 
 # A one-gloss model needs a "not signing" class, otherwise softmax always
 # outputs 1.0 for "hello" and the model can never say "nothing is happening".
