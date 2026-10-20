@@ -37,6 +37,7 @@ from tensorflow.keras.models import load_model
 from detector import GlossDetector
 from features import N_MODEL_FEATURES, build_features
 from gate import rest_gate
+from stream import GlossStream
 from utils import (ACTIONS_PATH, IDLE, MIN_WINDOW_FRAMES, MODEL_PATH, MU_PATH,
                    SEQ_LEN, SIGMA_PATH, WINDOW_SECONDS, draw_landmarks,
                    extract_keypoints, make_holistic, mediapipe_detection,
@@ -100,13 +101,13 @@ def glosses_to_sentence(glosses):
 colors = [(245, 117, 16), (117, 245, 16), (16, 117, 245), (200, 50, 200),
           (50, 200, 200), (200, 200, 50), (200, 50, 50)]
 buffer = deque()                      # (timestamp, keypoints) for the last WINDOW_SECONDS
-lock = threading.Lock()               # guards buffer, probs, glosses and the counters below
+lock = threading.Lock()               # guards buffer, probs, stream and the counters below
 new_frame = threading.Event()
 stop = threading.Event()
 probs = np.zeros(len(actions))
 idle_probs = np.zeros(len(actions))
 idle_probs[list(map(str, actions)).index(IDLE)] = 1.0
-glosses = []
+stream = GlossStream(max_items=MAX_GLOSSES)       # what goes into the sentence (see stream.py)
 detector = GlossDetector(actions, idle=IDLE)          # only the inference thread touches it
 state = {"sentence": "", "busy": False, "saved_until": 0.0,
          "frames": 0, "preds": 0, "error": None}
@@ -152,18 +153,19 @@ def inference_loop():
             gated = (not args.no_gate) and rest_gate(window)[0]
             p = idle_probs if gated else raw           # the detector and the display see the gated result
 
-            printed = []
-            for label, prob in detector.update(p, last_stamp):
-                printed.append(label)
-                print(f"gloss: {label} ({prob:.2f})")
+            events = detector.update(p, last_stamp)
+            printed, lines = [], []
             with lock:
                 probs = p
-                for label in printed:
-                    glosses.append(label)
-                glosses[:] = glosses[-MAX_GLOSSES:]
-                if printed:
-                    state["sentence"] = ""
+                for label, prob in events:
+                    printed.append(label)
+                    kept, note = stream.push(label, last_stamp)
+                    lines.append(f"gloss: {label} ({prob:.2f})" if kept else f"  skip: {label} ({note})")
+                    if kept:
+                        state["sentence"] = ""
                 state["preds"] += 1
+            for line in lines:
+                print(line)
             if debug_writer:
                 debug_writer.writerow([f"{last_stamp:.3f}"] + [f"{v:.3f}" for v in raw]   # raw model output
                                       + [int(gated), " ".join(printed)])
@@ -208,7 +210,7 @@ try:
                     buffer.popleft()
                 state["frames"] += 1
                 cur_probs = probs.copy()
-                cur_glosses = list(glosses)
+                cur_glosses = stream.labels
             if args.save_run:
                 run_stamps.append(now)
                 run_kps.append(kp)
@@ -244,14 +246,14 @@ try:
                 break
             elif key == ord("c"):
                 with lock:
-                    glosses.clear()
+                    stream.clear()
                 state["sentence"] = ""
             elif key == 13 and cur_glosses and not state["busy"]:
                 state["busy"] = True
                 # Run off the video thread so the feed does not freeze.
                 threading.Thread(target=finish, args=(list(cur_glosses),), daemon=True).start()
                 with lock:
-                    glosses.clear()
+                    stream.clear()
 finally:
     stop.set()
     worker.join(timeout=2.0)
