@@ -8,10 +8,12 @@ Why not just "probability above a threshold for N frames"?
 
 How it works: a "candidate" opens when a non-idle gloss is the top class with
 at least `enter` probability AND clearly ahead of the runner-up (`margin`).
-  * EARLY commit: `confirm` consecutive predictions >= `trigger` -> print now.
-  * LATE commit: if the sign was brief and never reached `trigger` twice, the
-    candidate is still printed when it closes, provided it lasted
-    `min_frames` predictions and its peak reached `min_peak`.
+  * EARLY commit: the gloss stayed >= `trigger` for `hold` seconds -> print now.
+  * LATE commit: if the sign was brief and never held `trigger` that long, the
+    candidate is still printed when it closes, provided it lasted `min_dur`
+    seconds and its peak reached `min_peak`.
+  * All durations are in seconds, so the result does not depend on how many
+    predictions per second the model manages (5 or 18 per second behave alike).
   * One candidate = one gloss. It closes when the gloss' probability falls
     below `exit` (the sign has passed) or another gloss takes over, so holding
     a sign prints it once, and the next sign can follow immediately.
@@ -23,12 +25,12 @@ import numpy as np
 
 
 class GlossDetector:
-    def __init__(self, actions, idle="idle", enter=0.55, trigger=0.75, confirm=2,
-                 exit=0.35, min_peak=0.60, min_frames=2, margin=0.20, cooldown=0.5):
+    def __init__(self, actions, idle="idle", enter=0.55, trigger=0.75, hold=0.25,
+                 exit=0.35, min_peak=0.60, min_dur=0.30, margin=0.20, cooldown=0.5):
         self.actions = [str(a) for a in actions]
         self.idle_idx = self.actions.index(idle) if idle in self.actions else -1
-        self.enter, self.trigger, self.confirm = enter, trigger, confirm
-        self.exit, self.min_peak, self.min_frames = exit, min_peak, min_frames
+        self.enter, self.trigger, self.hold = enter, trigger, hold
+        self.exit, self.min_peak, self.min_dur = exit, min_peak, min_dur
         self.margin, self.cooldown = margin, cooldown
         self.cand = None
         self.last_t = {}
@@ -58,7 +60,7 @@ class GlossDetector:
         if c is not None:
             switched = idx != c["idx"] and idx != self.idle_idx and p >= self.enter
             if probs[c["idx"]] < self.exit or switched:
-                if (not c["committed"] and c["n"] >= self.min_frames
+                if (not c["committed"] and c["t1"] - c["t0"] >= self.min_dur
                         and c["peak"] >= self.min_peak):
                     events += self._commit(c["idx"], c["peak"], now)
                 self.cand = c = None
@@ -66,13 +68,18 @@ class GlossDetector:
         # 2. open or update a candidate
         if idx != self.idle_idx and p >= self.enter and p - second >= self.margin:
             if c is None or c["idx"] != idx:
-                c = self.cand = {"idx": idx, "peak": p, "n": 1,
-                                 "hi": 1 if p >= self.trigger else 0, "committed": False}
+                c = self.cand = {"idx": idx, "peak": p, "t0": now, "t1": now,
+                                 "hi_since": now if p >= self.trigger else None,
+                                 "committed": False}
             else:
                 c["peak"] = max(c["peak"], p)
-                c["n"] += 1
-                c["hi"] = c["hi"] + 1 if p >= self.trigger else 0
-            if not c["committed"] and c["hi"] >= self.confirm:
+                c["t1"] = now
+                if p < self.trigger:
+                    c["hi_since"] = None
+                elif c["hi_since"] is None:
+                    c["hi_since"] = now
+            if (not c["committed"] and c["hi_since"] is not None
+                    and now - c["hi_since"] >= self.hold):
                 events += self._commit(idx, p, now)
                 c["committed"] = True
         return events

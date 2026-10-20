@@ -5,6 +5,7 @@ Usage:
     python realtime.py --grammar    # also turn the gloss sequence into an English sentence
     python realtime.py --debug      # also log every prediction to debug_probs.csv
     python realtime.py --save-run run1.npz   # also keep the raw frames, to replay and tune offline
+    python realtime.py --no-gate    # compare without the rest gate (see gate.py)
 
 Keys:  Enter = finish sentence and save to notes.txt   c = clear   q = quit
 
@@ -35,6 +36,7 @@ from tensorflow.keras.models import load_model
 
 from detector import GlossDetector
 from features import N_MODEL_FEATURES, build_features
+from gate import rest_gate
 from utils import (ACTIONS_PATH, IDLE, MIN_WINDOW_FRAMES, MODEL_PATH, MU_PATH,
                    SEQ_LEN, SIGMA_PATH, WINDOW_SECONDS, draw_landmarks,
                    extract_keypoints, make_holistic, mediapipe_detection,
@@ -50,6 +52,8 @@ parser.add_argument("--debug", action="store_true",
                     help="write every prediction to debug_probs.csv")
 parser.add_argument("--save-run", metavar="FILE", default=None,
                     help="save every captured frame (timestamps + keypoints) to this .npz file")
+parser.add_argument("--no-gate", action="store_true",
+                    help="switch off the rest gate (no hand in the window / no arm movement = idle)")
 args = parser.parse_args()
 
 # ------------------------------------------------------------------ load
@@ -100,6 +104,8 @@ lock = threading.Lock()               # guards buffer, probs, glosses and the co
 new_frame = threading.Event()
 stop = threading.Event()
 probs = np.zeros(len(actions))
+idle_probs = np.zeros(len(actions))
+idle_probs[list(map(str, actions)).index(IDLE)] = 1.0
 glosses = []
 detector = GlossDetector(actions, idle=IDLE)          # only the inference thread touches it
 state = {"sentence": "", "busy": False, "saved_until": 0.0,
@@ -109,7 +115,7 @@ debug_file = debug_writer = None
 if args.debug:
     debug_file = open("debug_probs.csv", "w", newline="", encoding="utf-8")
     debug_writer = csv.writer(debug_file)
-    debug_writer.writerow(["time"] + [str(a) for a in actions] + ["printed"])
+    debug_writer.writerow(["time"] + [str(a) for a in actions] + ["gate", "printed"])
 
 run_stamps, run_kps = [], []          # only filled with --save-run
 
@@ -142,7 +148,9 @@ def inference_loop():
             stamps = [t for t, _ in snap]
             window = resample_window(stamps, [k for _, k in snap], SEQ_LEN)
             x = (build_features(window) - mu) / sigma
-            p = predict_fn(tf.constant(x[None], tf.float32)).numpy()[0]
+            raw = predict_fn(tf.constant(x[None], tf.float32)).numpy()[0]
+            gated = (not args.no_gate) and rest_gate(window)[0]
+            p = idle_probs if gated else raw           # the detector and the display see the gated result
 
             printed = []
             for label, prob in detector.update(p, last_stamp):
@@ -157,8 +165,8 @@ def inference_loop():
                     state["sentence"] = ""
                 state["preds"] += 1
             if debug_writer:
-                debug_writer.writerow([f"{last_stamp:.3f}"] + [f"{v:.3f}" for v in p]
-                                      + [" ".join(printed)])
+                debug_writer.writerow([f"{last_stamp:.3f}"] + [f"{v:.3f}" for v in raw]   # raw model output
+                                      + [int(gated), " ".join(printed)])
     except Exception:                                   # show the real error, then stop everything
         state["error"] = traceback.format_exc()
         stop.set()
