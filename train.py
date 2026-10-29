@@ -29,8 +29,9 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import to_categorical
 
-from features import N_MODEL_FEATURES, STORED_FEATURES, add_augmented, build_features
-from utils import (ACTIONS, ACTIONS_PATH, ARTIFACTS, DATA_PATH, MODEL_PATH,
+from features import (N_MODEL_FEATURES, STORED_FEATURES, LeftPool, add_augmented, build_features,
+                      hide_left_hand, inject_left_hand, left_arm_at_rest, left_tracked_fraction)
+from utils import (ACTIONS, ACTIONS_PATH, ARTIFACTS, DATA_PATH, IDLE, MODEL_PATH,
                    MU_PATH, N_FEATURES, SEQ_LEN, SIGMA_PATH)
 
 SEED = 42
@@ -91,9 +92,24 @@ class_weight = dict(enumerate(compute_class_weight(
     "balanced", classes=np.arange(len(ACTIONS)), y=y_train)))
 print("class weights:", {ACTIONS[k]: round(float(v), 2) for k, v in class_weight.items()})
 
+# A resting left hand in view must not tell the model "idle" (see features.py). The pool of
+# real resting-left-hand frames comes from a --save-run recording:
+#     python make_left_pool.py run3.npz
+POOL_PATH = os.path.join(os.path.dirname(os.path.normpath(DATA_PATH)), "left_pool.npz")
+left_pool = LeftPool.load(POOL_PATH) if os.path.exists(POOL_PATH) else None
+idle_idx = ACTIONS.index(IDLE) if IDLE in ACTIONS else None
+rest_arm = left_arm_at_rest(X_train)
+if left_pool is None:
+    print(f"NOTE: no {POOL_PATH}. Without it a visible left hand may be read as 'idle'. "
+          "Make one from a run where your left hand rested in view: python make_left_pool.py run.npz")
+else:
+    print(f"left-hand pool: {len(left_pool.frames)} frames in {len(left_pool.lengths)} stretches")
+
 # Augment the training split only, then build model features.
+X_test_raw, y_test_raw = X_test, y_test          # untouched copies for the left-hand stress test below
 if AUG_COPIES:
-    X_train, y_train = add_augmented(X_train, y_train, AUG_COPIES, seed=SEED)
+    X_train, y_train = add_augmented(X_train, y_train, AUG_COPIES, seed=SEED, left_pool=left_pool,
+                                     rest_arm=rest_arm, idle_idx=idle_idx)
 print(f"train samples after augmentation: {len(X_train)}")
 
 X_train, X_val, X_test = [build_features(a) for a in (X_train, X_val, X_test)]
@@ -164,6 +180,31 @@ if confused:
     print("Most confused (true -> predicted):")
     for count, true, pred in confused[:8]:
         print(f"  {true} -> {pred}: {count}")
+
+# ------------------------------------------- left-hand stress test (test samples only)
+# The ordinary test set cannot show the left-hand shortcut, because its samples look like the
+# training samples. Here a resting left hand is added to right-handed test samples and removed
+# from idle test samples, exactly what happened in the live run that failed.
+if left_pool is not None or rest_arm is not None:
+    rng = np.random.default_rng(SEED)
+    lf = left_tracked_fraction(X_test_raw)
+    changed, stressed = [], []
+    for i, (w, label) in enumerate(zip(X_test_raw, y_test_raw)):
+        if left_pool is not None and lf[i] < 0.3:
+            changed.append(i)
+            stressed.append(inject_left_hand(w, left_pool, rng))
+        elif rest_arm is not None and label == idle_idx and lf[i] >= 0.3:
+            changed.append(i)
+            stressed.append(hide_left_hand(w, rest_arm))
+    if changed:
+        Xs = (build_features(np.stack(stressed)) - mu) / sigma
+        acc_clean = float(np.mean(y_pred[changed] == y_test_raw[changed]))
+        acc_stress = float(np.mean(model.predict(Xs, verbose=0).argmax(axis=1) == y_test_raw[changed]))
+        print(f"Left-hand stress test on {len(changed)} test samples: accuracy {acc_clean:.0%} as recorded "
+              f"-> {acc_stress:.0%} with the left hand added / removed")
+        if acc_stress < acc_clean - 0.10:
+            print("  The model still depends on the left hand. Add more resting-left-hand frames "
+                  "(make_left_pool.py) or record signs with the left hand resting in view.")
 
 plt.figure(figsize=(7, 6))
 plt.imshow(cm, cmap="Blues")

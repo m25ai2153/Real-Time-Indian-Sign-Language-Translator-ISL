@@ -125,11 +125,126 @@ def augment_window(window, rng, max_shift_frac=0.17, stretch=(0.7, 1.5)):
     return window[idx]
 
 
-def add_augmented(X, y, copies, seed=0):
-    """Return X, y plus `copies` augmented versions of every sample."""
+# ----------------------------------------------------------- left-hand decorrelation
+# In a live test the signer rested the LEFT hand on the desk, in view, while signing with
+# the right one. In the training data a visible left hand mostly meant "idle" (the signs
+# are nearly all right-handed), so the model called nearly every sign idle. The helpers
+# below break that shortcut: a resting left hand is added to right-handed training
+# samples, and removed from some idle samples, so its presence says nothing about the class.
+LEFT_ARM_POSE = (13, 15, 17, 19, 21)       # left elbow, wrist, pinky, index, thumb in the pose block
+LEFT_ARM_COLS = np.concatenate([np.arange(4 * i, 4 * i + 4) for i in LEFT_ARM_POSE])
+
+
+def left_tracked_fraction(window):
+    """Share of frames in which the left hand was tracked, for (T, 258) or (N, T, 258)."""
+    w = np.asarray(window)
+    return np.any(w[..., LEFT_HAND] != 0, axis=-1).mean(axis=-1)
+
+
+def set_left(window, hand, arm):
+    """Copy of a (T, 258) window with the left hand block and left arm pose replaced."""
+    out = np.array(window, dtype=np.float32, copy=True)
+    out[:, LEFT_HAND] = hand
+    out[:, LEFT_ARM_COLS] = arm
+    return out
+
+
+def left_arm_at_rest(X):
+    """Median left-arm pose (20 values) over all frames where the left hand was NOT tracked
+    (hand out of view, in the lap). Used to 'hide' a resting left hand."""
+    f = np.asarray(X, dtype=np.float32).reshape(-1, STORED_FEATURES)
+    lost = ~np.any(f[:, LEFT_HAND] != 0, axis=1)
+    return np.median(f[lost][:, LEFT_ARM_COLS], axis=0) if lost.any() else None
+
+
+class LeftPool:
+    """Real frames of a resting left hand (hand block + left arm pose), taken from a --save-run
+    recording in which the left hand stayed in view. Chunks are cut from long stretches in
+    which the left hand was tracked all the time."""
+
+    def __init__(self, frames, starts, lengths):
+        self.frames = np.asarray(frames, dtype=np.float32)
+        self.starts = np.asarray(starts, dtype=int)
+        self.lengths = np.asarray(lengths, dtype=int)
+
+    @classmethod
+    def from_runs(cls, runs, min_len=32):
+        frames, starts, lengths, pos = [], [], [], 0
+        for kp in runs:
+            kp = np.asarray(kp, dtype=np.float32)
+            ok = np.any(kp[:, LEFT_HAND] != 0, axis=1)
+            i = 0
+            while i < len(ok):
+                if not ok[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < len(ok) and ok[j]:
+                    j += 1
+                if j - i >= min_len:
+                    frames.append(kp[i:j])
+                    starts.append(pos)
+                    lengths.append(j - i)
+                    pos += j - i
+                i = j
+        if not frames:
+            raise ValueError("no stretch of at least %d frames with the left hand tracked" % min_len)
+        return cls(np.concatenate(frames), starts, lengths)
+
+    def save(self, path):
+        np.savez_compressed(path, frames=self.frames, starts=self.starts, lengths=self.lengths)
+
+    @classmethod
+    def load(cls, path):
+        z = np.load(path)
+        return cls(z["frames"], z["starts"], z["lengths"])
+
+    def chunk(self, rng, t):
+        """A random (t, 258) stretch of resting-left-hand frames."""
+        usable = np.flatnonzero(self.lengths >= t)
+        k = int(rng.choice(usable)) if len(usable) else int(rng.integers(len(self.lengths)))
+        n = int(self.lengths[k])
+        start = int(self.starts[k]) + (int(rng.integers(0, n - t + 1)) if n >= t else 0)
+        frames = self.frames[start:start + t]
+        if len(frames) < t:                                  # short stretch: repeat the last frame
+            frames = np.concatenate([frames, np.repeat(frames[-1:], t - len(frames), axis=0)])
+        return frames
+
+
+def inject_left_hand(window, pool, rng):
+    """Add a resting left hand (and left arm) to a window that has none."""
+    chunk = pool.chunk(rng, len(window))
+    return set_left(window, chunk[:, LEFT_HAND], chunk[:, LEFT_ARM_COLS])
+
+
+def hide_left_hand(window, rest_arm):
+    """Remove the left hand from a window and put the left arm back in the lap."""
+    t = len(window)
+    return set_left(window, np.zeros((t, LEFT_HAND.stop - LEFT_HAND.start), np.float32),
+                    np.tile(rest_arm, (t, 1)))
+
+
+def add_augmented(X, y, copies, seed=0, left_pool=None, rest_arm=None, idle_idx=None,
+                  p_inject=0.5, p_hide=0.4):
+    """Return X, y plus `copies` augmented versions of every sample.
+
+    Every copy is shifted / stretched in time. With a `left_pool`, a resting left hand is
+    added (probability p_inject) to samples that have no left hand; with `rest_arm` and
+    `idle_idx`, the left hand is removed (probability p_hide) from idle samples that have one.
+    """
     rng = np.random.default_rng(seed)
+    lfrac = left_tracked_fraction(X)
     xs, ys = [X], [y]
     for _ in range(copies):
-        xs.append(np.stack([augment_window(w, rng) for w in X]))
+        batch = []
+        for w, label, lf in zip(X, y, lfrac):
+            w = augment_window(w, rng)
+            if left_pool is not None and lf < 0.3 and rng.random() < p_inject:
+                w = inject_left_hand(w, left_pool, rng)
+            elif (rest_arm is not None and idle_idx is not None and label == idle_idx
+                  and lf >= 0.3 and rng.random() < p_hide):
+                w = hide_left_hand(w, rest_arm)
+            batch.append(w)
+        xs.append(np.stack(batch))
         ys.append(y)
     return np.concatenate(xs), np.concatenate(ys)

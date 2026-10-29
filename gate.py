@@ -11,7 +11,7 @@ resting window 0.03-0.10, so 0.15 sits in the gap.
 import numpy as np
 
 MIN_HAND_FRACTION = 0.10      # share of window steps with a tracked hand
-MIN_WRIST_MOTION = 0.15       # in shoulder widths: biggest x/y range of either wrist
+MIN_WRIST_MOTION = 0.00       # in shoulder widths: biggest x/y range of either wrist
 LEFT_WRIST, RIGHT_WRIST = 15, 16
 
 
