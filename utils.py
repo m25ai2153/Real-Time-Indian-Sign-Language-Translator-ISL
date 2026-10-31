@@ -13,7 +13,7 @@ import mediapipe as mp
 # Stage 1: one gloss. Stage 2: add more words to this list, record each one
 # with record.py, then retrain. Nothing else needs to change.
 GLOSSES = ["hello", "good","afternoon", "doctor", "I", "you", "head", "ache", "stomach", "need",  
-            "medicine", "water", "help", "thank_you", "yes", "no", "idle"]
+            "medicine", "water", "help", "thank_you", "yes", "no"]
 
 #"we", "they", "want", "go", "come", 
 #           "eat", "drink", "water", "food", "help", "stop", "wait", "yes", "no", 
