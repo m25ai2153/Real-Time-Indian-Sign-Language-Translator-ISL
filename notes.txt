@@ -1,0 +1,6 @@
+I hello I | Hello, I have a headache.
+I hello doctor I need doctor I you need doctor I I hello ache | I Hello doctor, I need a doctor. I need a doctor. I need a doctor. I have a headache.
+stomach ache I need medicine you need medicine I need water I need help | I have a stomach ache and need medicine. I need help.
+I doctor help | I have a doctor.
+doctor I head ache thank_you you thank_you doctor yes no I you afternoon doctor | Doctor, I have a headache. Thank you.
+you stomach ache doctor I need medicine I head ache need doctor I | You have a stomach ache. Doctor, I need medicine and need a doctor.
