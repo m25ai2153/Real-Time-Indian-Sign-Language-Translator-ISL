@@ -27,7 +27,8 @@ GREETINGS = {"hello": "Hello", "good afternoon": "Good afternoon", "thank_you": 
 ADDRESS = {"doctor": "doctor"}
 STANDALONE = {"yes": "Yes.", "no": "No."}
 
-HELD_OUT = {"you stomach ache", "doctor need medicine", "I head ache need doctor"}
+HELD_OUT_ORDER = ["you stomach ache", "doctor need medicine", "I head ache need doctor"]   # the order they are signed in tests
+HELD_OUT = set(HELD_OUT_ORDER)
 
 
 def _low(subject_en):                                  # "You" -> "you" inside a sentence, "I" stays
@@ -100,6 +101,49 @@ def generate():
     return pairs
 
 
+def generate_noisy(pairs, seed=0, per_kind=70):
+    """Pairs for glosses that carry a stray sign, built from the clean pairs.
+
+    Live runs showed that between two signs the sign model sometimes adds a pronoun
+    (a dangling "I" or "you" at the end of a sentence, a doubled "I I") and that the
+    translator then invented a symptom to explain it ("no yes I" -> "No, I have a headache").
+    These pairs teach it the honest reading: a pronoun with nothing after it is dropped, a
+    doubled pronoun counts once, and a pronoun on its own is just that pronoun. They are
+    made from the clean pairs by rule, so they grow with the vocabulary. Held-out sentences
+    are never used here.
+    """
+    rng = random.Random(seed)
+    pronouns = {g.split()[0] for g in SUBJECTS}                    # "I", "you"
+    clean = [(g, e) for g, e in sorted(pairs.items()) if g not in HELD_OUT]
+    noisy = {}
+    for p in pronouns:                                             # a pronoun on its own
+        noisy[p] = SUBJECTS[p] + "."
+    ends = [(g, e) for g, e in clean if g.split()[-1] not in pronouns]
+    for g, e in rng.sample(ends, min(per_kind, len(ends))):        # dangling pronoun at the end
+        noisy[f"{g} {rng.choice(sorted(pronouns))}"] = e
+    for g, e in clean:                                             # ... always for the recorded sentences
+        if g in RECORDED and g.split()[-1] not in pronouns:
+            for p in sorted(pronouns):
+                noisy[f"{g} {p}"] = e
+    starts = [(g, e) for g, e in clean if g.split()[0] in pronouns]
+    for g, e in rng.sample(starts, min(per_kind, len(starts))):    # doubled pronoun at the start
+        noisy[f"{g.split()[0]} {g}"] = e
+    for g in list(noisy):                                          # never clash with a clean pair
+        if g in pairs:
+            noisy.pop(g)
+    return noisy
+
+
+def noisy_held_out(pairs):
+    """The same kinds of stray sign added to the held-out sentences, only used to test."""
+    out = {}
+    for g in HELD_OUT_ORDER:
+        if g in pairs:
+            out[g + " I"] = pairs[g]
+            out[g + " you"] = pairs[g]
+    return out
+
+
 def split(pairs):
     train = {g: e for g, e in pairs.items() if g not in HELD_OUT}
     held = {g: pairs[g] for g in HELD_OUT if g in pairs}
@@ -123,6 +167,7 @@ RECORDED = {
 if __name__ == "__main__":
     pairs = generate()
     train, held = split(pairs)
+    noisy = generate_noisy(pairs)
     bad = {g: (e, pairs.get(g)) for g, e in RECORDED.items() if pairs.get(g) != e}
     assert not bad, f"generator does not reproduce the recorded sentences: {bad}"
     os.makedirs("Dataset", exist_ok=True)
@@ -131,6 +176,9 @@ if __name__ == "__main__":
     with open(os.path.join("Dataset", "gloss_pairs.jsonl"), "w", encoding="utf-8") as f:
         for g, e in rows:
             f.write(json.dumps({"glosses": g, "english": e}, ensure_ascii=False) + "\n")
+        for g, e in noisy.items():
+            f.write(json.dumps({"glosses": g, "english": e, "noisy": True}, ensure_ascii=False) + "\n")
+    print(f"{len(noisy)} noisy pairs (stray pronoun) generated")
     print(f"{len(train)} training pairs written to Dataset/gloss_pairs.jsonl; {len(held)} held out:")
     for g, e in held.items():
         print(f"   {g!r} -> {e!r}")

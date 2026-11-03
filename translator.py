@@ -15,6 +15,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -22,6 +23,67 @@ import threading
 PREFIX = "translate glosses to English: "
 DEFAULT_DIR = os.path.join("artifacts", "gloss_t5")
 TAG = "@@"                                         # marks protocol lines among any library output
+LICENSE_FILE = "licenses.json"                     # written by train_gloss_t5.py next to the model
+
+
+def build_licenses(pairs, min_pairs=2, min_link=0.9, max_glosses=3):
+    """Which sign "licenses" which English word? (computed from the clean training pairs)
+
+    A word is tied to a gloss when they (almost) always appear together, in both directions:
+    "headache" appears in every pair that has the gloss "head" and the gloss "head" appears
+    in nothing else. Function words ("have", "a", "and") are tied to nothing and stay free.
+    Returns {word: [glosses]}; a tied word may only appear in a translation when at least
+    one of its glosses was signed. Built from data, so it grows with the vocabulary.
+    Only short pairs (at most `max_glosses` signs) are counted: in the long combined
+    sentences every word co-occurs with every other and nothing is specific any more.
+    """
+    word_n, gloss_n, both = {}, {}, {}
+    for g, e in pairs.items():
+        if len(g.split()) > max_glosses:
+            continue
+        gs, ws = set(g.split()), set(re.findall(r"[a-z']+", e.lower()))
+        for w in ws:
+            word_n[w] = word_n.get(w, 0) + 1
+        for x in gs:
+            gloss_n[x] = gloss_n.get(x, 0) + 1
+        for w in ws:
+            for x in gs:
+                both[(w, x)] = both.get((w, x), 0) + 1
+    lic = {}
+    for (w, x), n in both.items():
+        if word_n[w] >= min_pairs and n / word_n[w] >= min_link and n / gloss_n[x] >= min_link:
+            lic.setdefault(w, []).append(x)
+    return {w: sorted(v) for w, v in sorted(lic.items())}
+
+
+def omitted(glosses, english, licenses):
+    """Signed glosses whose English word is missing from `english` (empty list = nothing was dropped).
+
+    The other direction of unsupported(): a sign tied to an English word ("head" -> "headache")
+    must show up in the translation. When several sentences run together the small model tends
+    to drop signs silently; this makes that visible. Signs tied to no word (yes, no, I, you) are not checked.
+    """
+    words = set(re.findall(r"[a-z']+", english.lower()))
+    tied = {}
+    for w, gs in licenses.items():
+        for g in gs:
+            tied.setdefault(g, set()).add(w)
+    seen, out = set(), []
+    for g in glosses:
+        for part in str(g).split():
+            if part in tied and part not in seen and not tied[part] & words:
+                out.append(part)
+            seen.add(part)
+    return out
+
+
+def unsupported(glosses, english, licenses):
+    """English words in `english` that need a sign which was not signed (empty list = fine)."""
+    signed = set()
+    for g in glosses:
+        signed.update(str(g).split())
+    words = set(re.findall(r"[a-z']+", english.lower()))
+    return sorted(w for w in words if w in licenses and not signed.intersection(licenses[w]))
 
 
 def plain(glosses):
@@ -35,11 +97,18 @@ class GlossTranslator:
         self.timeout = timeout
         self.cache = {}
         self.note = ""
+        self.licenses = {}
+        self.guard_note = {}                        # signs tuple -> why the translation was replaced by plain glosses
         self._lock = threading.Lock()
         self._lines = queue.Queue()
         if not os.path.isdir(model_dir):
             self.note = f"no model in {model_dir} (run train_gloss_t5.py); showing plain glosses"
             return
+        try:
+            with open(os.path.join(model_dir, LICENSE_FILE), encoding="utf-8") as f:
+                self.licenses = json.load(f)
+        except (OSError, ValueError):
+            self.note = "no licenses.json (re-run train_gloss_t5.py): the invented-word check is off"
         try:
             self.proc = subprocess.Popen(
                 [python or sys.executable, os.path.abspath(__file__), "--serve", model_dir],
@@ -75,12 +144,16 @@ class GlossTranslator:
             except Exception:
                 proc.kill()
 
-    def translate(self, glosses):
+    def translate(self, glosses, announce=False):
+        """English for the glosses. announce=True prints a console line when the guard replaced it
+        (use it for finished sentences; half-signed sentences change every second and would flood the console)."""
         glosses = [str(g) for g in glosses]
         if not glosses:
             return ""
         key = tuple(glosses)
         if key in self.cache:
+            if announce and key in self.guard_note:
+                print(self.guard_note[key])
             return self.cache[key]
         if not self.ready:
             return plain(glosses)
@@ -94,6 +167,14 @@ class GlossTranslator:
                 text = reply.get("text", "").strip() or plain(glosses)
             except Exception:
                 return plain(glosses)
+        extra = unsupported(glosses, text, self.licenses) if self.licenses else []
+        dropped = omitted(glosses, text, self.licenses) if self.licenses else []
+        if extra or dropped:                        # invented a word, or silently dropped a sign: show the glosses instead
+            why = (f"{' '.join(extra)!r} is not in the signs" if extra else f"the sign(s) {' '.join(dropped)!r} are missing from the English")
+            self.guard_note[key] = f"  translator guard: {why} ({' '.join(glosses)}); showing the glosses"
+            if announce:
+                print(self.guard_note[key])
+            text = plain(glosses)
         self.cache[key] = text
         if len(self.cache) > 200:
             self.cache.pop(next(iter(self.cache)))

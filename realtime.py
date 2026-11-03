@@ -111,7 +111,7 @@ def finalize(labels):
     if not labels:
         return
     try:
-        text = translator.translate(labels)
+        text = translator.translate(labels, announce=True)
     except Exception:
         text = plain(labels)
     with open(SAVE_FILE, "a", encoding="utf-8") as f:

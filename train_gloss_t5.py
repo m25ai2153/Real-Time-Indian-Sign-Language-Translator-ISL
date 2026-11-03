@@ -21,7 +21,7 @@ import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 import gloss_data
-from translator import DEFAULT_DIR, PREFIX
+from translator import DEFAULT_DIR, LICENSE_FILE, PREFIX, build_licenses, omitted, unsupported
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--base", default="google/flan-t5-small")
@@ -35,12 +35,14 @@ args = ap.parse_args()
 random.seed(args.seed); torch.manual_seed(args.seed)
 pairs = gloss_data.generate()
 train_all, held = gloss_data.split(pairs)
+noisy = gloss_data.generate_noisy(pairs)                                # glosses with a stray pronoun (see gloss_data.py)
+noisy_test = gloss_data.noisy_held_out(pairs)                           # the same on held-out sentences: test only
 items = sorted(train_all.items()); random.shuffle(items)
 n_val = max(10, len(items) // 10)
 must_train = [it for it in items if it[0] in gloss_data.RECORDED]       # the sentences you recorded are always trained on
 others = [it for it in items if it[0] not in gloss_data.RECORDED]
-val, train = others[:n_val], others[n_val:] + must_train
-print(f"{len(train)} training pairs, {len(val)} validation pairs, {len(held)} held-out sentences")
+val, train = others[:n_val], others[n_val:] + must_train + sorted(noisy.items())
+print(f"{len(train)} training pairs ({len(noisy)} with a stray pronoun), {len(val)} validation pairs, {len(held)} held-out sentences")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 tok = AutoTokenizer.from_pretrained(args.base)
@@ -109,7 +111,23 @@ held_rows = sorted(held.items())
 for (g, e), p in zip(held_rows, predict([g for g, _ in held_rows])):
     print(f"   {g!r} -> {p!r}   {'OK' if p == e else 'wanted ' + repr(e)}")
 
+print("\nHeld-out sentences with a stray pronoun added (never trained on):")
+noisy_rows = sorted(noisy_test.items())
+n_ok = 0
+for (g, e), p in zip(noisy_rows, predict([g for g, _ in noisy_rows])):
+    n_ok += p == e
+    print(f"   {g!r} -> {p!r}   {'OK' if p == e else 'wanted ' + repr(e)}")
+
+licenses = build_licenses(pairs)                                         # which sign licenses which English word
+flagged = [(g, e) for g, e in list(pairs.items()) + list(noisy.items()) if unsupported(g.split(), e, licenses) or omitted(g.split(), e, licenses)]
+print(f"\nInvented-word check: {len(licenses)} words tied to signs; "
+      f"{len(flagged)} of {len(pairs) + len(noisy)} reference translations would be wrongly refused")
+for g, e in flagged[:5]:
+    print(f"   {g!r} -> {e!r}: {unsupported(g.split(), e, licenses) + omitted(g.split(), e, licenses)}")
+
 os.makedirs(args.out, exist_ok=True)
+with open(os.path.join(args.out, LICENSE_FILE), "w", encoding="utf-8") as f:
+    json.dump(licenses, f, indent=1)
 model.save_pretrained(args.out); tok.save_pretrained(args.out)
 with open(os.path.join(args.out, "train_info.json"), "w") as f:
     json.dump({"base": args.base, "epochs": args.epochs, "pairs": len(train), "val_exact_match": acc}, f)

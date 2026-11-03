@@ -5,9 +5,9 @@ resting posture (hands in the lap, no hand visible) was classified as a sign for
 seconds at a time. Two facts hold for every sign in the data and are cheap to check:
   * a sign shows at least one hand, so a window with (almost) no tracked hand is rest;
   * a sign moves an arm, so a window in which both wrists hardly move is rest;
-  * a sign is made in front of the body, so a window in which both wrists stay down in the
-    lap is rest, even when the camera can see the hands there (run6: hands resting in the
-    lap with both hands tracked were read as the sign "I" for seconds).
+  * a window in which both wrists stay down in the lap AND hardly move is rest, even when the
+    camera can see the hands there (run6: hands resting in the lap with both hands tracked were
+    read as the sign "I" for seconds). Low signs such as "stomach" move more, so they pass.
 In your own recordings the quietest sign windows moved ~0.3 shoulder widths, a still
 resting window 0.03-0.10, so 0.15 sits in the gap.
 """
@@ -15,7 +15,8 @@ import numpy as np
 
 MIN_HAND_FRACTION = 0.10      # share of window steps with a tracked hand
 MIN_WRIST_MOTION = 0.0        # 0 = motion check off: a held sign like "good" barely moves the wrist
-REST_BELOW = 1.2              # shoulder widths below the shoulder line: both wrists lower than this all window = rest
+REST_BELOW = 1.0              # both wrists lower than this (shoulder widths below the shoulder line) all window ...
+REST_STILL = 0.20             # ... and the wrists moved less than this = resting in the lap (not a low sign like "stomach")
 LEFT_WRIST, RIGHT_WRIST = 15, 16
 
 
@@ -40,5 +41,5 @@ def rest_gate(window, min_hand=MIN_HAND_FRACTION, min_motion=MIN_WRIST_MOTION):
     w = np.asarray(window, dtype=np.float32)
     hand = float(np.mean(np.any(w[:, 132:258] != 0, axis=1)))
     motion = window_motion(w)
-    low = highest_wrist(w) > REST_BELOW
+    low = highest_wrist(w) > REST_BELOW and motion < REST_STILL
     return (hand < min_hand or motion < min_motion or low), hand, motion
